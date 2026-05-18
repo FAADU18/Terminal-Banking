@@ -37,7 +37,7 @@ CREATE TABLE accounts (
   status ENUM('ACTIVE','INACTIVE','FROZEN','CLOSED') DEFAULT 'ACTIVE',
   daily_transfer_limit DECIMAL(18,2) DEFAULT 1000.00,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  INDEX(idx_customer) (customer_id),
+  INDEX idx_customer (customer_id),
   FOREIGN KEY (customer_id) REFERENCES customers(id) ON DELETE CASCADE,
   FOREIGN KEY (account_type_id) REFERENCES account_types(id)
 ) ENGINE=InnoDB;
