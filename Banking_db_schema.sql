@@ -91,15 +91,40 @@ CREATE TABLE loans (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   customer_id BIGINT NOT NULL,
   loan_account_id BIGINT,
+  loan_number VARCHAR(40) UNIQUE,
+  loan_type ENUM('PERSONAL','HOME','AUTO','EDUCATION','BUSINESS') DEFAULT 'PERSONAL',
   principal DECIMAL(18,2) NOT NULL,
   interest_rate DECIMAL(5,2) NOT NULL,
   term_months INT NOT NULL,
+  emi_amount DECIMAL(18,2) DEFAULT 0.00,
   outstanding_amount DECIMAL(18,2) NOT NULL,
+  disbursed_amount DECIMAL(18,2) DEFAULT 0.00,
+  disbursed_at DATETIME,
   start_date DATE,
   end_date DATE,
   status ENUM('ACTIVE','CLOSED','DEFAULTED','SETTLED') DEFAULT 'ACTIVE',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (customer_id) REFERENCES customers(id)
+  FOREIGN KEY (customer_id) REFERENCES customers(id),
+  FOREIGN KEY (loan_account_id) REFERENCES accounts(id) ON DELETE SET NULL
+) ENGINE=InnoDB;
+
+-- Loan repayment schedule and history
+CREATE TABLE loan_repayments (
+  id BIGINT AUTO_INCREMENT PRIMARY KEY,
+  loan_id BIGINT NOT NULL,
+  account_id BIGINT NOT NULL,
+  due_date DATE,
+  paid_date DATETIME,
+  amount_due DECIMAL(18,2) NOT NULL,
+  amount_paid DECIMAL(18,2) DEFAULT 0.00,
+  principal_component DECIMAL(18,2) DEFAULT 0.00,
+  interest_component DECIMAL(18,2) DEFAULT 0.00,
+  penalty_amount DECIMAL(18,2) DEFAULT 0.00,
+  status ENUM('DUE','PAID','PARTIAL','MISSED') DEFAULT 'DUE',
+  payment_reference VARCHAR(128),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (loan_id) REFERENCES loans(id) ON DELETE CASCADE,
+  FOREIGN KEY (account_id) REFERENCES accounts(id)
 ) ENGINE=InnoDB;
 
 -- Fixed deposits
@@ -214,6 +239,8 @@ CREATE TABLE account_locks (
 -- Indexes to speed common queries
 CREATE INDEX idx_txn_account_created ON transactions(account_id, created_at);
 CREATE INDEX idx_accounts_number ON accounts(account_number);
+CREATE INDEX idx_loans_customer_status ON loans(customer_id, status);
+CREATE INDEX idx_loan_repayments_loan_due ON loan_repayments(loan_id, due_date);
 
 -- View: mini statement (last N transactions can be obtained using a procedure)
 CREATE VIEW account_balances AS
@@ -332,6 +359,191 @@ BEGIN
   END IF;
 END$$
 
+-- Procedure to apply loan payment from an account
+CREATE PROCEDURE sp_pay_loan(
+  IN p_loan_id BIGINT,
+  IN p_from_account_number VARCHAR(34),
+  IN p_amount DECIMAL(18,2),
+  IN p_remarks TEXT,
+  OUT p_result VARCHAR(255)
+)
+BEGIN
+  DECLARE v_acc_id BIGINT;
+  DECLARE v_cust_id BIGINT;
+  DECLARE v_balance DECIMAL(18,2);
+  DECLARE v_outstanding DECIMAL(18,2);
+  DECLARE v_effective_amount DECIMAL(18,2);
+
+  START TRANSACTION;
+
+  SELECT id, customer_id, balance INTO v_acc_id, v_cust_id, v_balance
+  FROM accounts
+  WHERE account_number = p_from_account_number AND status = 'ACTIVE'
+  FOR UPDATE;
+
+  IF v_acc_id IS NULL THEN
+    SET p_result = 'ACCOUNT_NOT_FOUND_OR_INACTIVE';
+    ROLLBACK;
+  ELSE
+    SELECT outstanding_amount INTO v_outstanding
+    FROM loans
+    WHERE id = p_loan_id AND status = 'ACTIVE'
+    FOR UPDATE;
+
+    IF v_outstanding IS NULL THEN
+      SET p_result = 'LOAN_NOT_FOUND_OR_NOT_ACTIVE';
+      ROLLBACK;
+    ELSEIF p_amount <= 0 THEN
+      SET p_result = 'INVALID_AMOUNT';
+      ROLLBACK;
+    ELSEIF v_balance < p_amount THEN
+      SET p_result = 'INSUFFICIENT_FUNDS';
+      ROLLBACK;
+    ELSE
+      SET v_effective_amount = LEAST(p_amount, v_outstanding);
+
+      UPDATE accounts SET balance = balance - v_effective_amount WHERE id = v_acc_id;
+
+      UPDATE loans
+      SET outstanding_amount = outstanding_amount - v_effective_amount,
+          status = CASE WHEN (outstanding_amount - v_effective_amount) <= 0 THEN 'CLOSED' ELSE status END
+      WHERE id = p_loan_id;
+
+      INSERT INTO loan_repayments(
+        loan_id, account_id, due_date, paid_date, amount_due, amount_paid,
+        principal_component, interest_component, penalty_amount, status, payment_reference
+      ) VALUES (
+        p_loan_id, v_acc_id, CURDATE(), NOW(), v_effective_amount, v_effective_amount,
+        v_effective_amount, 0.00, 0.00, 'PAID', CONCAT('LNP-', UNIX_TIMESTAMP())
+      );
+
+      INSERT INTO transactions(account_id, related_account_number, beneficiary_id, amount, txn_type, status, remarks, reference, balance_after)
+      VALUES (v_acc_id, NULL, NULL, v_effective_amount, 'LOAN_PAYMENT', 'COMPLETED', p_remarks, CONCAT('LNP-',UNIX_TIMESTAMP()), (SELECT balance FROM accounts WHERE id = v_acc_id));
+
+      INSERT INTO audit_logs(user_id, action, object_type, object_id, new_value, source)
+      VALUES (v_cust_id, 'LOAN_PAYMENT', 'loans', CAST(p_loan_id AS CHAR), JSON_OBJECT('amount', v_effective_amount, 'account', p_from_account_number, 'remarks', p_remarks), 'sp_pay_loan');
+
+      INSERT INTO notifications(customer_id, type, channel, message)
+      VALUES (v_cust_id, 'LOAN', 'IN_APP', CONCAT('Loan payment received: ', FORMAT(v_effective_amount,2), ' for loan #', p_loan_id));
+
+      COMMIT;
+      SET p_result = 'OK';
+    END IF;
+  END IF;
+
+  SELECT p_result;
+END$$
+
+-- Procedure to process due recurring payments for a date
+CREATE PROCEDURE sp_process_recurring_payments(IN p_run_date DATE)
+BEGIN
+  DECLARE v_done INT DEFAULT 0;
+  DECLARE v_id BIGINT;
+  DECLARE v_account_id BIGINT;
+  DECLARE v_amount DECIMAL(18,2);
+  DECLARE v_beneficiary_id BIGINT;
+  DECLARE v_frequency VARCHAR(16);
+  DECLARE v_next_run DATE;
+  DECLARE v_acc_balance DECIMAL(18,2);
+  DECLARE v_acc_number VARCHAR(34);
+  DECLARE v_beneficiary_acc VARCHAR(34);
+  DECLARE v_customer_id BIGINT;
+
+  DECLARE cur CURSOR FOR
+    SELECT rp.id, rp.account_id, rp.amount, rp.beneficiary_id, rp.frequency, rp.next_run
+    FROM recurring_payments rp
+    WHERE rp.status = 'ACTIVE' AND rp.next_run <= p_run_date;
+  DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
+
+  OPEN cur;
+
+  read_loop: LOOP
+    FETCH cur INTO v_id, v_account_id, v_amount, v_beneficiary_id, v_frequency, v_next_run;
+    IF v_done = 1 THEN
+      LEAVE read_loop;
+    END IF;
+
+    SELECT a.balance, a.account_number, a.customer_id INTO v_acc_balance, v_acc_number, v_customer_id
+    FROM accounts a
+    WHERE a.id = v_account_id
+    FOR UPDATE;
+
+    SELECT b.beneficiary_account_number INTO v_beneficiary_acc
+    FROM beneficiaries b
+    WHERE b.id = v_beneficiary_id;
+
+    IF v_acc_balance >= v_amount THEN
+      UPDATE accounts SET balance = balance - v_amount WHERE id = v_account_id;
+
+      INSERT INTO transactions(account_id, related_account_number, beneficiary_id, amount, txn_type, status, remarks, reference, balance_after)
+      VALUES (v_account_id, v_beneficiary_acc, v_beneficiary_id, v_amount, 'TRANSFER', 'COMPLETED', 'Recurring payment', CONCAT('RCP-', UNIX_TIMESTAMP(), '-', v_id), (SELECT balance FROM accounts WHERE id = v_account_id));
+
+      INSERT INTO notifications(customer_id, type, channel, message)
+      VALUES (v_customer_id, 'RECURRING_PAYMENT', 'IN_APP', CONCAT('Recurring payment of ', FORMAT(v_amount,2), ' processed successfully.'));
+    ELSE
+      INSERT INTO notifications(customer_id, type, channel, message)
+      VALUES (v_customer_id, 'RECURRING_PAYMENT_FAILED', 'IN_APP', CONCAT('Recurring payment of ', FORMAT(v_amount,2), ' failed due to insufficient funds.'));
+    END IF;
+
+    UPDATE recurring_payments
+    SET next_run = CASE v_frequency
+      WHEN 'DAILY' THEN DATE_ADD(v_next_run, INTERVAL 1 DAY)
+      WHEN 'WEEKLY' THEN DATE_ADD(v_next_run, INTERVAL 1 WEEK)
+      WHEN 'MONTHLY' THEN DATE_ADD(v_next_run, INTERVAL 1 MONTH)
+      WHEN 'YEARLY' THEN DATE_ADD(v_next_run, INTERVAL 1 YEAR)
+      ELSE v_next_run
+    END
+    WHERE id = v_id;
+  END LOOP;
+
+  CLOSE cur;
+END$$
+
+-- Trigger: auto-notify on large transfers and create fraud flags
+CREATE TRIGGER trg_transactions_fraud_notify
+AFTER INSERT ON transactions
+FOR EACH ROW
+BEGIN
+  DECLARE v_customer_id BIGINT;
+  SELECT customer_id INTO v_customer_id FROM accounts WHERE id = NEW.account_id;
+
+  IF NEW.txn_type = 'TRANSFER' AND NEW.amount >= 50000.00 THEN
+    INSERT INTO fraud_flags(account_id, transaction_id, flag_type, score, details)
+    VALUES (NEW.account_id, NEW.id, 'LARGE_TRANSFER', 85.00, JSON_OBJECT('amount', NEW.amount, 'reference', NEW.reference));
+
+    INSERT INTO notifications(customer_id, type, channel, message)
+    VALUES (v_customer_id, 'FRAUD_ALERT', 'IN_APP', CONCAT('High-value transfer detected: ', FORMAT(NEW.amount,2), '. If not you, contact support immediately.'));
+  END IF;
+END$$
+
+-- Trigger: lock account after repeated high-risk fraud flags
+CREATE TRIGGER trg_fraud_lock_account
+AFTER INSERT ON fraud_flags
+FOR EACH ROW
+BEGIN
+  DECLARE v_count INT DEFAULT 0;
+  DECLARE v_customer_id BIGINT;
+
+  IF NEW.account_id IS NOT NULL THEN
+    SELECT COUNT(*) INTO v_count
+    FROM fraud_flags
+    WHERE account_id = NEW.account_id
+      AND created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+      AND score >= 85.00;
+
+    IF v_count >= 3 THEN
+      UPDATE accounts SET status = 'FROZEN' WHERE id = NEW.account_id;
+
+      INSERT INTO account_locks(account_id, locked_by, reason, active)
+      VALUES (NEW.account_id, 'SYSTEM', 'Auto freeze due to repeated high-risk fraud flags', 1);
+
+      SELECT customer_id INTO v_customer_id FROM accounts WHERE id = NEW.account_id;
+      INSERT INTO notifications(customer_id, type, channel, message)
+      VALUES (v_customer_id, 'ACCOUNT_FROZEN', 'IN_APP', 'Your account was temporarily frozen for security review.');
+    END IF;
+  END IF;
+END$$
+
 DELIMITER ;
 
 -- Sample Queries
@@ -347,3 +559,9 @@ INSERT INTO account_types(code, name, interest_rate, min_balance) VALUES ('SAVIN
 
 -- 4. Make a transfer (example)
 -- CALL sp_transfer('ACC123','EXT999',100.00,'<otp_hash>','Rent payment', @res); SELECT @res;
+
+-- 5. Pay loan installment
+-- CALL sp_pay_loan(1, 'ACC123', 500.00, 'Monthly EMI', @loan_res); SELECT @loan_res;
+
+-- 6. Process recurring payments for today
+-- CALL sp_process_recurring_payments(CURDATE());

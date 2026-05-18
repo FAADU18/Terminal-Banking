@@ -80,6 +80,37 @@ class Bank:
                 )
                 """
             )
+            self.conns["system"].execute(
+                """
+                CREATE TABLE IF NOT EXISTS loans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loan_number TEXT NOT NULL UNIQUE,
+                    account_number INTEGER NOT NULL,
+                    principal REAL NOT NULL,
+                    interest_rate REAL NOT NULL,
+                    term_months INTEGER NOT NULL,
+                    emi_amount REAL NOT NULL,
+                    outstanding_amount REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'ACTIVE',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (account_number) REFERENCES accounts(account_number)
+                )
+                """
+            )
+            self.conns["system"].execute(
+                """
+                CREATE TABLE IF NOT EXISTS loan_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    loan_id INTEGER NOT NULL,
+                    account_number INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    remarks TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (loan_id) REFERENCES loans(id),
+                    FOREIGN KEY (account_number) REFERENCES accounts(account_number)
+                )
+                """
+            )
 
     def _hash_pin(self, pin, source="app"):
         if source == "system":
@@ -96,6 +127,30 @@ class Bank:
 
     def _get_connection(self, source):
         return self.conns[source]
+
+    def _set_balance_in_all_dbs(self, acc_num, balance):
+        with self.conns["app"]:
+            self.conns["app"].execute(
+                "UPDATE accounts SET balance = ? WHERE account_number = ?",
+                (balance, acc_num),
+            )
+        with self.conns["system"]:
+            self.conns["system"].execute(
+                "UPDATE accounts SET balance = ? WHERE account_number = ?",
+                (balance, acc_num),
+            )
+
+    def _generate_loan_number(self):
+        row = self.conns["system"].execute("SELECT COALESCE(MAX(id), 0) AS max_id FROM loans").fetchone()
+        next_id = row["max_id"] + 1
+        return f"LN-{next_id:06d}"
+
+    def _calculate_emi(self, principal, annual_rate, term_months):
+        monthly_rate = annual_rate / 12 / 100
+        if monthly_rate == 0:
+            return principal / term_months
+        factor = (1 + monthly_rate) ** term_months
+        return principal * monthly_rate * factor / (factor - 1)
 
     def _fetch_account(self, acc_num):
         for source, conn in self.conns.items():
@@ -319,6 +374,188 @@ class Bank:
                     print(f"{i}. [{row['created_at']}] {row['transaction_type']} {direction} ${row['amount']:.2f} ({row['transaction_status']}) ID={row['transaction_id']}")
         print(f"\nCurrent Balance: ${acc.balance:.2f}")
 
+    def apply_loan(self, acc):
+        print("\n=== APPLY FOR LOAN ===")
+        principal_str = input("Enter loan amount: $").strip()
+        term_str = input("Enter tenure in months (e.g., 12, 24, 36): ").strip()
+        rate_str = input("Enter annual interest rate % (default 12): ").strip() or "12"
+
+        try:
+            principal = float(principal_str)
+            term_months = int(term_str)
+            annual_rate = float(rate_str)
+        except ValueError:
+            print("Invalid loan input!")
+            return
+
+        if principal <= 0 or term_months <= 0 or annual_rate < 0:
+            print("Loan values must be positive (rate can be zero).")
+            return
+
+        emi = self._calculate_emi(principal, annual_rate, term_months)
+        loan_number = self._generate_loan_number()
+
+        with self.conns["system"]:
+            self.conns["system"].execute(
+                """
+                INSERT INTO loans (
+                    loan_number, account_number, principal, interest_rate,
+                    term_months, emi_amount, outstanding_amount, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+                """,
+                (loan_number, acc.acc_num, principal, annual_rate, term_months, emi, principal),
+            )
+
+        # Disburse loan amount directly into the account.
+        acc.balance += principal
+        self._set_balance_in_all_dbs(acc.acc_num, acc.balance)
+        self._save_transaction(
+            acc.acc_num,
+            f"Loan disbursed {loan_number}: +${principal:.2f}",
+            source=acc.source,
+            tx_type="LOAN_DISBURSAL",
+            amount=principal,
+            receiver_account=acc.acc_num,
+        )
+
+        print("\n✓ Loan approved and disbursed!")
+        print(f"Loan Number: {loan_number}")
+        print(f"EMI Amount: ${emi:.2f}")
+        print(f"Updated Balance: ${acc.balance:.2f}")
+
+    def view_loans(self, acc):
+        print("\n=== MY LOANS ===")
+        rows = self.conns["system"].execute(
+            """
+            SELECT id, loan_number, principal, interest_rate, term_months,
+                   emi_amount, outstanding_amount, status, created_at
+            FROM loans
+            WHERE account_number = ?
+            ORDER BY id DESC
+            """,
+            (acc.acc_num,),
+        ).fetchall()
+
+        if not rows:
+            print("No loans found for this account.")
+            return
+
+        for row in rows:
+            print(
+                f"[{row['id']}] {row['loan_number']} | Principal=${row['principal']:.2f} | "
+                f"Outstanding=${row['outstanding_amount']:.2f} | EMI=${row['emi_amount']:.2f} | "
+                f"Rate={row['interest_rate']:.2f}% | Status={row['status']}"
+            )
+
+    def pay_loan(self, acc):
+        print("\n=== PAY LOAN EMI ===")
+        active_loans = self.conns["system"].execute(
+            """
+            SELECT id, loan_number, emi_amount, outstanding_amount
+            FROM loans
+            WHERE account_number = ? AND status = 'ACTIVE'
+            ORDER BY id
+            """,
+            (acc.acc_num,),
+        ).fetchall()
+
+        if not active_loans:
+            print("No active loans to pay.")
+            return
+
+        for row in active_loans:
+            print(
+                f"[{row['id']}] {row['loan_number']} | EMI=${row['emi_amount']:.2f} | "
+                f"Outstanding=${row['outstanding_amount']:.2f}"
+            )
+
+        loan_id_str = input("Enter loan ID to pay: ").strip()
+        amount_str = input("Enter payment amount: $").strip()
+        remarks = input("Remarks (optional): ").strip()
+
+        try:
+            loan_id = int(loan_id_str)
+            payment_amount = float(amount_str)
+        except ValueError:
+            print("Invalid loan id or amount!")
+            return
+
+        if payment_amount <= 0:
+            print("Payment amount must be positive!")
+            return
+
+        loan_row = self.conns["system"].execute(
+            """
+            SELECT id, loan_number, outstanding_amount
+            FROM loans
+            WHERE id = ? AND account_number = ? AND status = 'ACTIVE'
+            """,
+            (loan_id, acc.acc_num),
+        ).fetchone()
+
+        if not loan_row:
+            print("Active loan not found for this account.")
+            return
+
+        if payment_amount > acc.balance:
+            print(f"Insufficient funds! Current balance: ${acc.balance:.2f}")
+            return
+
+        effective_payment = min(payment_amount, loan_row["outstanding_amount"])
+        new_outstanding = loan_row["outstanding_amount"] - effective_payment
+        new_status = "CLOSED" if new_outstanding <= 0 else "ACTIVE"
+
+        with self.conns["system"]:
+            self.conns["system"].execute(
+                "UPDATE loans SET outstanding_amount = ?, status = ? WHERE id = ?",
+                (new_outstanding, new_status, loan_id),
+            )
+            self.conns["system"].execute(
+                """
+                INSERT INTO loan_payments (loan_id, account_number, amount, remarks)
+                VALUES (?, ?, ?, ?)
+                """,
+                (loan_id, acc.acc_num, effective_payment, remarks or None),
+            )
+
+        acc.balance -= effective_payment
+        self._set_balance_in_all_dbs(acc.acc_num, acc.balance)
+        self._save_transaction(
+            acc.acc_num,
+            f"Loan payment {loan_row['loan_number']}: -${effective_payment:.2f}",
+            source=acc.source,
+            tx_type="LOAN_PAYMENT",
+            amount=effective_payment,
+        )
+
+        print("\n✓ Loan payment successful!")
+        print(f"Paid: ${effective_payment:.2f}")
+        print(f"Remaining Outstanding: ${new_outstanding:.2f}")
+        print(f"Updated Balance: ${acc.balance:.2f}")
+
+    def loan_menu(self, acc):
+        while True:
+            print("\n" + "-" * 40)
+            print("   LOAN SERVICES")
+            print("-" * 40)
+            print("1. Apply for Loan")
+            print("2. View My Loans")
+            print("3. Pay Loan EMI")
+            print("4. Back")
+            print("-" * 40)
+
+            loan_choice = input("Select an option (1-4): ").strip()
+            if loan_choice == "1":
+                self.apply_loan(acc)
+            elif loan_choice == "2":
+                self.view_loans(acc)
+            elif loan_choice == "3":
+                self.pay_loan(acc)
+            elif loan_choice == "4":
+                break
+            else:
+                print("Invalid option! Please try again.")
+
     def close(self):
         for conn in self.conns.values():
             conn.close()
@@ -353,10 +590,11 @@ def main():
                     print("2. Deposit")
                     print("3. Withdraw")
                     print("4. Transaction History")
-                    print("5. Logout")
+                    print("5. Loan Services")
+                    print("6. Logout")
                     print("-"*40)
                     
-                    acc_choice = input("Select an option (1-5): ").strip()
+                    acc_choice = input("Select an option (1-6): ").strip()
                     
                     if acc_choice == '1':
                         bank.check_balance(acc)
@@ -367,6 +605,8 @@ def main():
                     elif acc_choice == '4':
                         bank.view_transactions(acc)
                     elif acc_choice == '5':
+                        bank.loan_menu(acc)
+                    elif acc_choice == '6':
                         print("\n✓ Logged out successfully!")
                         break
                     else:
